@@ -192,7 +192,9 @@ def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:
 
 class Repository:
     def __init__(self, url: str) -> None:
-        kwargs: dict[str, Any] = {}
+        # pool_pre_ping: test a pooled connection before handing it out and replace it if the server has dropped it.
+        # Managed PostgreSQL closes idle connections, and without this the first request after a quiet period fails.
+        kwargs: dict[str, Any] = {"pool_pre_ping": True}
         # A single shared connection (in-memory SQLite) must not be used by two
         # threads at once. File and server databases pool connections and don't
         # need this.

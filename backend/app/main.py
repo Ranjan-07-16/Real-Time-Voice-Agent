@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
 import httpx
+from google.auth import exceptions as google_exceptions
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
@@ -20,7 +21,7 @@ from sqlalchemy.exc import OperationalError
 from app.auth import COOKIE, Auth, EmailTaken, public_user
 from app.brains import build_brain
 from app.brains.base import Brain
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, production_warnings
 from app.db import Repository
 from app.errors import register_error_handlers
 from app.health import router as health_router
@@ -37,6 +38,17 @@ from app.telephony.routes import register as register_telephony
 from app.workflows import JobDispatcher, SchedulerConfig, WorkflowEngine, WorkflowScheduler
 
 log = logging.getLogger("voice_agent")
+
+# Fetching Google's signing certificates is network I/O. google-auth's own default is 120 seconds, which would
+# pin a worker thread (and the person's sign-in) for two minutes when Google is slow.
+GOOGLE_CERTS_TIMEOUT_SECONDS = 10
+
+
+class GoogleRequest(google_requests.Request):
+    """google-auth's HTTP transport with a sane timeout. Nothing else about it changes."""
+
+    def __call__(self, url, method="GET", body=None, headers=None, timeout=GOOGLE_CERTS_TIMEOUT_SECONDS, **kwargs):
+        return super().__call__(url, method, body, headers, timeout, **kwargs)
 
 
 class StartCall(BaseModel):
@@ -91,6 +103,10 @@ def create_app(
     """Everything but `settings` is injectable, for tests."""
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+
+    for warning in production_warnings(settings):
+        log.warning("Production configuration: %s", warning)
+
     brain = brain if brain is not None else build_brain(settings)
     repo = repo or Repository(settings.database_url)
     http = http or httpx.AsyncClient()
@@ -159,7 +175,11 @@ def create_app(
         version="0.2.0",
         lifespan=lifespan,
         # Starlette's debug mode renders tracebacks and bypasses the error handlers.
-        debug=settings.debug and settings.app_env != "production",
+        debug=settings.debug and not settings.is_production,
+        # The interactive API documentation is a development aid: in production the schema is not published.
+        docs_url=None if settings.is_production else "/docs",
+        redoc_url=None if settings.is_production else "/redoc",
+        openapi_url=None if settings.is_production else "/openapi.json",
     )
     app.state.service = service
     app.state.auth = auth
@@ -171,10 +191,13 @@ def create_app(
         register_telephony(app, service, telephony)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=settings.cors_origins,  # CORS_ORIGINS: never "*", because credentials are allowed
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        # Every method the API serves: PUT and DELETE (agents, contacts, workflows) need it in a preflight.
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type", "X-API-Key"],
+        # A cross-origin page can only read the headers listed here; the console shows the rate-limit wait.
+        expose_headers=["Retry-After"],
     )
 
     def find(call_id: str):
@@ -292,15 +315,7 @@ def create_app(
         if user is None:
             raise HTTPException(401, "Invalid email or password")
 
-        response.set_cookie(
-            COOKIE,
-            await auth.start_session(user),
-            max_age=settings.auth_session_hours * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=settings.cookie_secure,
-            path="/",
-        )
+        auth.set_session_cookie(response, await auth.start_session(user))
         return {"user": public_user(user)}
 
 
@@ -315,13 +330,27 @@ def create_app(
         if not settings.google_client_id:
             raise HTTPException(503, "Google sign-in is not configured")
 
+        # Network I/O (Google's signing certificates), so it runs on a worker thread: this process also carries
+        # live phone audio, and a slow Google must not stall the event loop. google-auth checks the signature,
+        # the expiry, the issuer (accounts.google.com) and that the audience is this client id.
         try:
-            claims = id_token.verify_oauth2_token(
+            claims = await asyncio.to_thread(
+                id_token.verify_oauth2_token,
                 body.credential,
-                google_requests.Request(),
+                GoogleRequest(),
                 settings.google_client_id,
             )
-        except ValueError:
+        except (google_exceptions.TransportError, json.JSONDecodeError) as error:
+            # Google's certificates could not be fetched (network, timeout, outage) or came back unreadable
+            # (google-auth wraps a bad credential's JSON in MalformedError, so a raw JSONDecodeError can only be
+            # the certificates). Not a bad credential. Only the exception class is logged: never the credential
+            # or the provider's text.
+            log.warning("Google sign-in unavailable: %s", type(error.__cause__ or error).__name__)
+            raise HTTPException(503, "Google sign-in is temporarily unavailable") from None
+        except (ValueError, google_exceptions.GoogleAuthError) as error:
+            # A malformed, forged, expired or foreign credential (wrong audience or issuer). Anything else,
+            # a programming error for instance, is not an authentication failure and is left to the 500 handler.
+            log.info("Google sign-in refused: %s", type(error).__name__)
             raise HTTPException(401, "Invalid Google credential") from None
 
         email = str(claims.get("email", "")).strip().lower()
@@ -333,15 +362,7 @@ def create_app(
         if user is None or user["disabled"]:
             raise HTTPException(401, "Google account is not authorized")
 
-        response.set_cookie(
-            COOKIE,
-            await auth.start_session(user),
-            max_age=settings.auth_session_hours * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=settings.cookie_secure,
-            path="/",
-        )
+        auth.set_session_cookie(response, await auth.start_session(user))
 
         return {"user": public_user(user)}
 
@@ -362,15 +383,7 @@ def create_app(
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
 
-        response.set_cookie(
-            COOKIE,
-            await auth.start_session(user),
-            max_age=settings.auth_session_hours * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=settings.cookie_secure,
-            path="/",
-        )
+        auth.set_session_cookie(response, await auth.start_session(user))
         response.status_code = 201
 
         return {"user": public_user(user)}
@@ -378,7 +391,7 @@ def create_app(
     @app.post("/api/auth/logout", status_code=204)
     async def logout(request: Request, response: Response) -> Response:
         await auth.end_session(request.cookies.get(COOKIE))
-        response.delete_cookie(COOKIE, path="/")
+        auth.clear_session_cookie(response)
         response.status_code = 204
         return response
 

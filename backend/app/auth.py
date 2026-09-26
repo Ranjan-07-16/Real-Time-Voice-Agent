@@ -9,17 +9,22 @@ This module handles the first; the API key and callee token are checked where us
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from sqlalchemy.exc import IntegrityError
 from starlette.requests import Request
+from starlette.responses import Response
 
 from app.config import Settings
 from app.db import Repository
 from app.security import DUMMY_HASH, hash_password, hash_token, new_token, verify_password
 
 COOKIE = "va_session"
+# Lax on purpose: the frontend is meant to reach this API as its own origin (the dev proxy, or the frontend host
+# forwarding /api), which makes the cookie first-party. A cross-site cookie (SameSite=None) is deliberately not offered.
+COOKIE_SAMESITE: Literal["lax"] = "lax"
+COOKIE_PATH = "/"
 ROLES = ("admin", "operator")
 UNSAFE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
@@ -94,6 +99,29 @@ class Auth:
     async def end_session(self, token: str | None) -> None:
         if token:
             await self._db(self.repo.delete_auth_session, hash_token(token))
+
+    # The session cookie is set and cleared here and nowhere else, so both always carry the same
+    # attributes (a browser only replaces or removes a cookie whose name, path and domain match).
+
+    def set_session_cookie(self, response: Response, token: str) -> None:
+        response.set_cookie(
+            COOKIE,
+            token,
+            max_age=self.settings.auth_session_hours * 3600,
+            httponly=True,
+            samesite=COOKIE_SAMESITE,
+            secure=self.settings.cookie_secure,
+            path=COOKIE_PATH,
+        )
+
+    def clear_session_cookie(self, response: Response) -> None:
+        response.delete_cookie(
+            COOKIE,
+            path=COOKIE_PATH,
+            httponly=True,
+            samesite=COOKIE_SAMESITE,
+            secure=self.settings.cookie_secure,
+        )
 
     async def user_for_request(self, request: Request) -> dict[str, Any] | None:
         token = request.cookies.get(COOKIE)

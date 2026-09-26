@@ -1,0 +1,13 @@
+# Everything needed to run the tests: pip install -r requirements-dev.txt
+# (A server installs only requirements.txt.) Same version floors as before they were moved out of requirements.txt.
+-r requirements.txt
+
+pytest>=8
+pytest-asyncio>=0.23
+pytest-timeout>=2
+
+# An independent implementation to cross-check our Twilio signature validation (those tests skip without it).
+twilio>=9
+
+# The Pipecat tests also need requirements-pipecat.txt. Without it most of them skip, but tests/test_pipecat_contract.py
+# and the [pipecat] cases in tests/test_voice_runtime_selection.py fail with "No module named 'pipecat'".

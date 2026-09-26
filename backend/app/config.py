@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,7 +24,10 @@ class Settings(BaseSettings):
     # A single LLM round-trip (including streaming it) must finish within this.
     brain_timeout_seconds: float = 30.0
 
-    # The Vite dev server proxies /api, so CORS only matters for other origins.
+    # The Vite dev server proxies /api, so CORS only matters for other origins. A JSON list in the environment:
+    # CORS_ORIGINS=["https://app.example.com"]. Each entry is an exact origin (scheme + host, no path, no trailing
+    # slash). These origins are also the ones allowed to make signed-in writes (see Auth.origin_ok), including when a
+    # frontend host forwards /api to this server, because the browser still sends the frontend's Origin.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     # Persistence. Required, so a missing value fails loudly instead of quietly using another
@@ -61,6 +65,8 @@ class Settings(BaseSettings):
     cookie_secure: bool = False  # set true when served over https (always, in production)
     # Behind a reverse proxy, how many proxies to trust for X-Forwarded-For. 0 = none,
     # use the socket address. Wrong values let clients pick their own rate-limit identity.
+    # Set it to the number of proxies in YOUR deployment's chain (it differs between hosts); with 0 behind a
+    # proxy, every client shares the proxy's address and therefore one rate-limit bucket.
     trusted_proxy_hops: int = 0
 
     # Requests per minute. The window is one minute.
@@ -115,6 +121,47 @@ class Settings(BaseSettings):
     def _agent_ids_are_integers(cls, value: str) -> str:
         pipecat_agent_ids(value)  # a typo must fail at startup, not silently select nothing
         return value
+
+    @property
+    def is_production(self) -> bool:
+        """APP_ENV=production, however it is capitalised or padded: what switches off the development aids
+        (tracebacks in the browser, the interactive API documentation)."""
+        return self.app_env.strip().lower() == "production"
+
+
+def production_warnings(settings: Settings) -> list[str]:
+    """Settings that are legal but almost certainly wrong for a production deployment: one readable line each,
+    naming the variable and never its value. Only advice, never a refusal to start: whoever runs the server
+    knows things this cannot (for example that no proxy sits in front of it)."""
+    if not settings.is_production:
+        return []
+
+    warnings = []
+
+    if not settings.cookie_secure:
+        warnings.append("COOKIE_SECURE is false, so the session cookie would also travel over plain http: set COOKIE_SECURE=true.")
+
+    if not settings.auth_required:
+        warnings.append("AUTH_REQUIRED is false, so the console endpoints need no sign-in: set AUTH_REQUIRED=true.")
+
+    if settings.database_url.startswith("sqlite"):
+        warnings.append("DATABASE_URL is a SQLite file: hosting disks are usually wiped on every deploy and one file cannot be shared. Use PostgreSQL.")
+    elif not settings.database_url.startswith("postgresql+psycopg://"):
+        warnings.append("DATABASE_URL should start with postgresql+psycopg:// (postgres:// and postgresql:// select a driver that is not installed).")
+
+    if settings.trusted_proxy_hops == 0:
+        warnings.append(
+            "TRUSTED_PROXY_HOPS is 0: every client is rate-limited by the address of whatever connects to this server. "
+            "Behind a reverse proxy, set it to the number of proxies in front of this process."
+        )
+
+    if settings.allow_private_callbacks:
+        warnings.append("ALLOW_PRIVATE_CALLBACKS is true: result callbacks may reach private addresses. It is for local development only.")
+
+    if urlsplit(settings.public_base_url).hostname in ("localhost", "127.0.0.1", "::1"):
+        warnings.append("PUBLIC_BASE_URL still points at localhost: set it to the frontend's public https address (answer links and the origin check use it).")
+
+    return warnings
 
 
 def pipecat_agent_ids(value: str) -> frozenset[int]:

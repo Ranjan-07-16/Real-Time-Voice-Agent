@@ -23,9 +23,12 @@ browser  ──  /api/calls/{id}/turn (SSE)  ──►  session ──► brain 
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt plus the test tools; a server installs requirements.txt only
 cp .env.example .env            # then edit .env: at least DATABASE_URL (and GEMINI_API_KEY for the LLM)
 ```
+
+Putting this on a real server (PostgreSQL, https, one instance, the Vercel frontend, Google sign-in) is
+covered in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 `.env` is gitignored and holds your real values. Only `.env.example` (placeholders) is committed.
 All settings are read once through `app/config.py`; code uses `settings.database_url`, never
@@ -35,8 +38,8 @@ All settings are read once through `app/config.py`; code uses `settings.database
 |---|---|---|
 | `DATABASE_URL` | **required** | `postgresql+psycopg://user:password@host:5432/dbname`. There is no default, so a missing value is an error rather than a quiet fallback to another database |
 | `APP_NAME` | `Real-Time Voice Agent` | API title |
-| `APP_ENV` | `development` | `development`, `staging` or `production` |
-| `DEBUG` | `false` | Renders tracebacks in the browser for unhandled errors. Ignored when `APP_ENV=production` |
+| `APP_ENV` | `development` | `development`, `staging` or `production`. `production` switches off tracebacks and the `/docs`, `/redoc` and `/openapi.json` pages, and makes start-up log a warning for each risky setting (`production_warnings` in `app/config.py`) |
+| `DEBUG` | `false` | Renders tracebacks in the browser for unhandled errors. Ignored when `APP_ENV=production` (however it is capitalised) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
 ## PostgreSQL
@@ -345,11 +348,13 @@ Which runtime conducts a phone call is chosen once, when the call starts (`app/v
   `pip install -r requirements-pipecat.txt` (exactly `pipecat-ai==1.11.0`). `Session.process_turn` still owns all
   conversation policy; Pipecat only carries frames. Recognition and speech are the same Deepgram classes.
 - `VOICE_RUNTIME_PIPECAT_AGENT_IDS=3,7`: with `pipecat`, only those agents' calls use it (empty = every call).
-- `VOICE_PIPECAT_VAD=off|observe` (default `off`; only with `VOICE_RUNTIME=pipecat`). `observe` is **experimental and
+- `VOICE_PIPECAT_VAD=off|observe|interrupt` (default `off`; only with `VOICE_RUNTIME=pipecat`). `observe` is **experimental and
   observation-only**: it runs Pipecat's Silero VAD next to the call and records when speech started and stopped (in memory,
   no text, no audio, nothing stored). It does **not** affect turn detection, interruptions or anything else the call does:
   Deepgram's `speech_final` / `UtteranceEnd` still end every utterance, and the session's own rules still decide barge-in.
-  If the VAD cannot be created, the call is conducted by the legacy runtime and the fallback is logged.
+  If the VAD cannot be created, the call is conducted by the legacy runtime and the fallback is logged. `interrupt` does
+  everything `observe` does and also passes VAD's speech-started signal to `SessionProcessor` as an inert diagnostic hint:
+  it never itself interrupts, clears playback or starts a turn (`app/pipecat_runtime/session_processor.py`).
 - `VOICE_PIPECAT_STT=compat|native` (default `compat`; only with `VOICE_RUNTIME=pipecat`). `compat` is the existing,
   reference recognizer: `RecognizerProcessor` wrapping the existing Deepgram Listener, unchanged since Step 10. `native`
   is **experimental**: Pipecat's own `DeepgramSTTService` (`app/pipecat_runtime/native_stt.py`), configured to match
@@ -401,11 +406,13 @@ source .venv/bin/activate
 alembic upgrade head                                         # create the schema (first run, and after updates)
 python -m app.cli create-user you@example.com --role admin   # nobody can sign in until you do this
 python -m app.cli seed-demo                                  # optional: one demo customer per profile
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000                    # development: 127.0.0.1, auto-reload
 
 # in another terminal
 cd frontend && npm run dev      # Vite proxies /api to :8000
 ```
+
+That is the **development** command. Production is different (`--host 0.0.0.0 --port $PORT --no-access-log`, one worker, no `--reload`): see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 Without `GEMINI_API_KEY` the server still starts. `/api/health` reports `"brain": null`, and
 the browser falls back to its built-in local runtime, so the demo works with no key.
@@ -424,8 +431,13 @@ the brain, profiles and whether sign-in is required.)
 ## Tests
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
+
+Run it from a checkout without your own `.env` if you can: settings are read from `.env` in the working directory, and a
+developer's `VOICE_AGENT_API_KEY` there overrides the API key the tests configure, which makes about a hundred of them fail
+with `Invalid API key`. Tests that need `pipecat` fail unless `requirements-pipecat.txt` is installed.
 
 No key, network or running PostgreSQL is needed: tests use in-memory SQLite, except the ones that
 check the server survives an unreachable PostgreSQL, which point at a closed port.
@@ -533,7 +545,14 @@ create their own (see **Self-service sign-up** below). Passwords are
 hashed with scrypt (12+ characters), the cookie is `HttpOnly` and `SameSite=Lax` (set
 `COOKIE_SECURE=true` behind https), only a hash of each session token is stored, and disabling a
 user signs them out at once. A signed-in browser's writes are refused if their `Origin` is not
-the frontend's. Login gives the same answer for an unknown email and a wrong password.
+the frontend's (`CORS_ORIGINS` and `PUBLIC_BASE_URL`). Login gives the same answer for an unknown email and a wrong password.
+
+**Google sign-in** (`POST /api/auth/google`, `GOOGLE_CLIENT_ID`): the browser sends Google's ID token; the server verifies
+it (signature, expiry, issuer, and that the audience is `GOOGLE_CLIENT_ID`), requires a verified email, and signs in the
+existing, enabled user with that email. It never creates an account. An invalid, forged, expired or foreign credential is a
+`401`; Google being unreachable or its certificates unreadable is a `503`; anything else is a `500`. The check runs on a
+worker thread with a 10-second limit on fetching Google's certificates, so it never blocks the calls this process carries.
+OAuth client setup and the deployment topology: [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### Self-service sign-up
 
