@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Reques
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.auth import COOKIE, Auth, EmailTaken, public_user
 from app.brains import build_brain
@@ -151,6 +151,16 @@ def create_app(
         except OperationalError as error:  # the API should still come up; a restart resumes them
             log.error(
                 "Could not resume pending callbacks; restart once the database is reachable (%s)",
+                type(error.orig).__name__,
+            )
+        except ProgrammingError as error:
+            # A reachable database that is missing a table or column the query expects: not migrated (the
+            # warning just above already said so), or mid-upgrade. Same as an outage: come up anyway, since a
+            # restart after `alembic upgrade head` resumes these. Without this, `migrated()`'s own warning
+            # would be immediately followed by this exact query crashing startup outright.
+            log.error(
+                "Could not resume pending callbacks; the database schema looks out of date, run "
+                "`alembic upgrade head` (%s)",
                 type(error.orig).__name__,
             )
 
