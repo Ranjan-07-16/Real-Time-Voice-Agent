@@ -12,6 +12,7 @@ const SignIn = lazy(() => import("./site/SignIn.jsx"));
 const SignUp = lazy(() => import("./site/SignUp.jsx"));
 const OperatorConsole = lazy(() => import("./app/OperatorConsole.jsx"));
 const CalleeRoute = lazy(() => import("./app/CalleeRoute.jsx"));
+const LiveKitTest = lazy(() => import("./app/LiveKitTest.jsx"));
 
 // Every URL lands on something: a screen, the sign-in redirect, the retry screen, or "not found".
 // Nothing falls through to a loading mark.
@@ -28,6 +29,7 @@ function Screen() {
   if (route === "landing") return <Landing />;
   if (route === "signin") return <SignIn />;
   if (route === "signup") return <SignUp />;
+  if (route === "livekit-test") return <LiveKitTest />;
 
   if (isAppRoute(route)) {
     return (

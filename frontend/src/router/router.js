@@ -19,6 +19,10 @@ export const ROUTES = [
   { name: "analytics", path: "/app/analytics" },
   { name: "settings", path: "/app/settings" },
   { name: "console", path: "/app/console" },
+  // A throwaway LiveKit transport-test page (Step 4D). Deliberately outside /app: it renders
+  // directly from App.jsx's Screen(), not through AppGate/OperatorConsole, exactly like
+  // CalleeRoute's special-purpose page - see frontend/src/app/LiveKitTest.jsx.
+  { name: "livekit-test", path: "/dev/livekit-test" },
 ];
 
 const NOT_FOUND = { name: "not-found", params: {}, redirect: null };

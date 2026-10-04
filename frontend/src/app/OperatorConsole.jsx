@@ -20,6 +20,7 @@ import { useRouter } from "../router/context.js";
 import { fetchCustomers } from "../runtime/customers.js";
 import { DEFAULT_PROFILE_ID, PROFILES, getProfile } from "../profiles/index.js";
 import { useVoiceAgent } from "../runtime/useVoiceAgent.js";
+import RealtimeVoiceSession from "../components/voice-agent/RealtimeVoiceSession";
 import "../styles/voice-agent.css";
 
 // The operator console the application has always had (voice call, call history, contacts,
@@ -373,7 +374,45 @@ export default function OperatorConsole() {
           </main>
         )}
 
-        {view === "home" && (
+        {view === "home" && serverBrain && agentRecordId ? (
+          // The verified realtime path (LiveKit + the separate worker + Deepgram + ADK/Gemini +
+          // Deepgram TTS - see backend/livekit_agent/worker.py): used once a real backend Agent
+          // exists for this organization. The old browser-speech/text-turn engine below remains for
+          // local/offline mode and is unchanged - CalleeRoute.jsx's real Twilio callee screen also
+          // still uses it untouched.
+          <main key={view} className="view-frame voice-main">
+            <RealtimeVoiceSession agentId={agentRecordId} agentName={record.agent.agentName} onViewHistory={() => navigate("history")}>
+              {({ dock, transcript }) => (
+                <>
+                  <div className="home-center">
+                    <WelcomeBar contact={record.contact} agentName={record.agent.agentName} status={record.status} />
+
+                    <CallSummary
+                      record={record}
+                      configured={Boolean(agentConfig)}
+                      view={summaryView}
+                      onViewChange={(next) => setRecordView({ callId: record.callId, view: next })}
+                      onConfigure={openConfig}
+                    />
+
+                    {dock}
+                  </div>
+
+                  <div className="voice-right-column">
+                    <AgentResponse
+                      messages={transcript.messages}
+                      canClear={false}
+                      agentName={transcript.agentName}
+                      status={transcript.messages.length || transcript.interim ? CALL_STATE_TEXT[transcript.callState] : null}
+                    />
+
+                    <CallDetails record={record} summary={agent.summary} onViewTranscript={showTranscript} />
+                  </div>
+                </>
+              )}
+            </RealtimeVoiceSession>
+          </main>
+        ) : view === "home" ? (
           <main key={view} className="view-frame voice-main">
             <div className="home-center">
               <WelcomeBar contact={record.contact} agentName={record.agent.agentName} status={record.status} />
@@ -415,7 +454,7 @@ export default function OperatorConsole() {
               <CallDetails record={record} summary={agent.summary} onViewTranscript={showTranscript} />
             </div>
           </main>
-        )}
+        ) : null}
       </div>
     </div>
   );

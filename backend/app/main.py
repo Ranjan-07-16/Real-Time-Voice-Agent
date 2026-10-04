@@ -3,9 +3,12 @@ import hmac
 import json
 import logging
 import math
+import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
+from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -15,6 +18,7 @@ from google.oauth2 import id_token
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from livekit import api as livekit_api
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -35,7 +39,9 @@ from app.session import mark_playback_interrupted, process_turn
 from app.store import SessionStore, TooManySessions
 from app.telephony import Telephony, build_telephony
 from app.telephony.routes import register as register_telephony
+from app.voice_context import agent_context_from_record, render_agent_brief
 from app.workflows import JobDispatcher, SchedulerConfig, WorkflowEngine, WorkflowScheduler
+from livekit_agent.config import MissingConfiguration, load_livekit
 
 log = logging.getLogger("voice_agent")
 
@@ -87,6 +93,18 @@ class GoogleLoginRequest(BaseModel):
 
 class AnswerRequest(BaseModel):
     token: str = Field(min_length=1, max_length=64)
+
+
+class LiveKitTokenResponse(BaseModel):
+    """What the browser needs to join a LiveKit room, and nothing more: never the API secret that
+    signed the token (see /api/livekit/token). agent_id/agent_name echo back the agent the caller
+    selected (None when the default/test session was requested), so the page can show it."""
+
+    url: str
+    token: str
+    room: str
+    agent_id: int | None = None
+    agent_name: str | None = None
 
 
 def sse(event: dict[str, Any]) -> str:
@@ -738,6 +756,75 @@ def create_app(
             raise translate(error) from None
 
         return Response(status_code=204)
+
+    # --- LiveKit (development transport test: Step 4D) -----------------------------------------
+    #
+    # A minimal, isolated addition, proving Browser -> this endpoint -> LiveKit room -> the separate
+    # LiveKit Agent worker (backend/livekit_agent/). It reuses the existing operator session exactly
+    # as every other authenticated route does; it does not add a new authentication mechanism, and it
+    # does not touch Twilio, the database, or any existing voice runtime. LiveKit's own config is
+    # loaded independently (app.config.Settings has no LiveKit fields, on purpose: see
+    # livekit_agent/config.py), and only LIVEKIT_URL and a short-lived, narrowly-scoped token ever
+    # reach the response - LIVEKIT_API_SECRET never leaves this function.
+    #
+    # Deliberately minimal for a development milestone: no rate limit of its own (the operator
+    # session it requires is the gate), and the room is a one-off, throwaway name with no lifecycle
+    # management - a real room-management policy is later work, not part of proving the transport.
+
+    @app.post("/api/livekit/token")
+    async def livekit_token(
+        user: Annotated[dict, Depends(operator)], agent_id: Annotated[int | None, Query()] = None
+    ) -> LiveKitTokenResponse:
+        try:
+            config = load_livekit()
+        except MissingConfiguration:
+            raise HTTPException(503, "LiveKit is not configured on this server") from None
+
+        # Server-generated, never the browser's own suggestion: nothing about this call trusts a
+        # caller-supplied room name.
+        room = f"dev-test-{secrets.token_hex(8)}"
+
+        room_config = None
+        agent_name = None
+
+        if agent_id is not None:
+            # The same organization-scoped lookup GET /api/agents/{agent_id} uses (see service.get_agent):
+            # an agent_id the browser supplies is never trusted on its own, only one this operator's own
+            # organization actually owns. Only the resolved, size-bounded brief - never the raw row, never
+            # a secret - crosses into the room's metadata, which LiveKit relays to the worker job
+            # (ctx.job.room.metadata; see livekit_agent/worker.py) over the same signed-token channel that
+            # already gates who may join this room at all.
+            try:
+                agent = await service.get_agent(agent_id, user["organization_id"])
+            except NotFound as error:
+                raise translate(error) from None
+
+            agent_context = agent_context_from_record(SimpleNamespace(**agent))
+            agent_name = agent_context.name
+            room_config = livekit_api.RoomConfiguration(
+                metadata=json.dumps(
+                    {
+                        "agent_id": agent_context.id,
+                        "agent_name": agent_context.name,
+                        "voice": agent["voice"],
+                        "brief": render_agent_brief(agent_context),
+                    }
+                )
+            )
+
+        grants = livekit_api.VideoGrants(room_join=True, room=room)
+        token_builder = (
+            livekit_api.AccessToken(config.api_key, config.api_secret)
+            .with_identity(f"operator-{user['id']}")
+            .with_grants(grants)
+            .with_ttl(timedelta(minutes=10))
+        )
+        if room_config is not None:
+            token_builder = token_builder.with_room_config(room_config)
+
+        return LiveKitTokenResponse(
+            url=config.url, token=token_builder.to_jwt(), room=room, agent_id=agent_id, agent_name=agent_name
+        )
 
     return app
 
